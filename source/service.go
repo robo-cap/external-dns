@@ -515,6 +515,7 @@ func extractServiceIps(svc *v1.Service) endpoint.Targets {
 }
 
 func extractServiceExternalName(svc *v1.Service) endpoint.Targets {
+
 	if len(svc.Spec.ExternalIPs) > 0 {
 		return svc.Spec.ExternalIPs
 	}
@@ -545,6 +546,45 @@ func extractLoadBalancerTargets(svc *v1.Service, resolveLoadBalancerHostname boo
 			} else {
 				targets = append(targets, lb.Hostname)
 			}
+		}
+	}
+	
+	excludeTargetNetCIDR := getExcludeTargetNetFromAnnotations(svc.Annotations)
+	targetNetFilterCIDR := getTargetNetFilterFromAnnotations(svc.Annotations)
+	
+	if excludeTargetNetCIDR != "" {
+		
+		_, parsedExcludeTargetNetCIDR, err := net.ParseCIDR(excludeTargetNetCIDR)
+		
+		if err != nil {
+			log.Errorf("Invalid value of excludeTargetNetCIDR annotation for service %s/%s error: %v", svc.Namespace, svc.Name, err)
+		} else {
+			var excludeFilteredTargets endpoint.Targets
+			for _, ip := range(targets) {
+				target_ip := net.ParseIP(ip)
+				if !parsedExcludeTargetNetCIDR.Contains(target_ip) {
+					excludeFilteredTargets = append(excludeFilteredTargets, ip)
+				}
+			}
+			targets = excludeFilteredTargets
+		}
+	}
+
+	if targetNetFilterCIDR != "" {
+		
+		_, parsedTargetNetFilterCIDR, err := net.ParseCIDR(targetNetFilterCIDR)
+		
+		if err != nil {
+			log.Errorf("Invalid value of targetNetFilterCIDR annotation for service %s/%s error: %v", svc.Namespace, svc.Name, err)
+		} else {
+			var filteredTargets endpoint.Targets
+			for _, ip := range(targets) {
+				target_ip := net.ParseIP(ip)
+				if parsedTargetNetFilterCIDR.Contains(target_ip) {
+					filteredTargets = append(filteredTargets, ip)
+				}
+			}
+			targets = filteredTargets
 		}
 	}
 

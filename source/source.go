@@ -60,6 +60,10 @@ const (
 	controllerAnnotationValue = "dns-controller"
 	// The annotation used for defining the desired hostname
 	internalHostnameAnnotationKey = "external-dns.alpha.kubernetes.io/internal-hostname"
+	// The annotation used to exclude subnet CIDR
+	excludeTargetNetKey = "external-dns.alpha.kubernetes.io/exclude-target-net"
+	// The annotation used to consider only subnet CIDR
+	targetNetFilterKey = "external-dns.alpha.kubernetes.io/target-net-filter"
 )
 
 const (
@@ -103,6 +107,25 @@ func getTTLFromAnnotations(annotations map[string]string, resource string) endpo
 		return ttlNotConfigured
 	}
 	return endpoint.TTL(ttlValue)
+}
+
+func getExcludeTargetNetFromAnnotations(annotations map[string]string) string {
+
+	excludeTargetNet, exists := annotations[excludeTargetNetKey]
+	if !exists {
+		return ""
+	}
+	return excludeTargetNet
+}
+
+
+func getTargetNetFilterFromAnnotations(annotations map[string]string) string {
+
+	targetNetFilter, exists := annotations[targetNetFilterKey]
+	if !exists {
+		return ""
+	}
+	return targetNetFilter
 }
 
 // parseTTL parses TTL from string, returning duration in seconds.
