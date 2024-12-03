@@ -20,7 +20,7 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"strings"
+	//"strings"
 	"time"
 
 	"github.com/oracle/oci-go-sdk/v65/common"
@@ -54,6 +54,11 @@ type OCIConfig struct {
 	Auth              OCIAuthConfig `yaml:"auth"`
 	CompartmentID     string        `yaml:"compartment"`
 	ZoneCacheDuration time.Duration
+}
+
+type RecordData struct {
+	RData string
+	TTL   int
 }
 
 // OCIProvider is an implementation of Provider for Oracle Cloud Infrastructure
@@ -202,11 +207,55 @@ func (p *OCIProvider) newFilteredRecordOperations(endpoints []*endpoint.Endpoint
 	ops := []dns.RecordOperation{}
 	for _, endpoint := range endpoints {
 		if p.domainFilter.Match(endpoint.DNSName) {
-			ops = append(ops, newRecordOperation(endpoint, opType))
+			ops = append(ops, newRecordOperation(endpoint, opType)...)
 		}
 	}
 	return ops
 }
+
+// // Records returns the list of records in a given hosted zone.
+// func (p *OCIProvider) Records(ctx context.Context) ([]*endpoint.Endpoint, error) {
+// 	zones, err := p.zones(ctx)
+// 	if err != nil {
+// 		return nil, provider.NewSoftError(fmt.Errorf("getting zones: %w", err))
+// 	}
+
+// 	endpoints := []*endpoint.Endpoint{}
+// 	for _, zone := range zones {
+// 		var page *string
+// 		for {
+// 			resp, err := p.client.GetZoneRecords(ctx, dns.GetZoneRecordsRequest{
+// 				ZoneNameOrId:  zone.Id,
+// 				Page:          page,
+// 				CompartmentId: &p.cfg.CompartmentID,
+// 			})
+// 			if err != nil {
+// 				return nil, provider.NewSoftError(fmt.Errorf("getting records for zone %q: %w", *zone.Id, err))
+// 			}
+
+// 			for _, record := range resp.Items {
+// 				if !provider.SupportedRecordType(*record.Rtype) {
+// 					continue
+// 				}
+// 				endpoints = append(endpoints,
+// 					endpoint.NewEndpointWithTTL(
+// 						*record.Domain,
+// 						*record.Rtype,
+// 						endpoint.TTL(*record.Ttl),
+// 						*record.Rdata,
+// 					),
+// 				)
+// 			}
+
+// 			if page = resp.OpcNextPage; resp.OpcNextPage == nil {
+// 				break
+// 			}
+// 		}
+// 	}
+// 	fmt.Printf("Discovered Endpoints: %+v\n", endpoints)
+// 	return endpoints, nil
+// }
+
 
 // Records returns the list of records in a given hosted zone.
 func (p *OCIProvider) Records(ctx context.Context) ([]*endpoint.Endpoint, error) {
@@ -216,8 +265,12 @@ func (p *OCIProvider) Records(ctx context.Context) ([]*endpoint.Endpoint, error)
 	}
 
 	endpoints := []*endpoint.Endpoint{}
+
 	for _, zone := range zones {
 		var page *string
+		// Map to group records by domain and record type
+		recordMap := make(map[string]map[string][]RecordData)
+
 		for {
 			resp, err := p.client.GetZoneRecords(ctx, dns.GetZoneRecordsRequest{
 				ZoneNameOrId:  zone.Id,
@@ -232,36 +285,68 @@ func (p *OCIProvider) Records(ctx context.Context) ([]*endpoint.Endpoint, error)
 				if !provider.SupportedRecordType(*record.Rtype) {
 					continue
 				}
-				endpoints = append(endpoints,
-					endpoint.NewEndpointWithTTL(
-						*record.Domain,
-						*record.Rtype,
-						endpoint.TTL(*record.Ttl),
-						*record.Rdata,
-					),
-				)
+
+				domain := *record.Domain
+				rtype := *record.Rtype
+				rdata := *record.Rdata
+				ttl := int(*record.Ttl)
+
+				// Initialize inner map if not present
+				if _, exists := recordMap[domain]; !exists {
+					recordMap[domain] = make(map[string][]RecordData)
+				}
+
+				// Append record data grouped by domain and rtype
+				recordMap[domain][rtype] = append(recordMap[domain][rtype], RecordData{
+					RData: rdata,
+					TTL:   ttl,
+				})
 			}
 
 			if page = resp.OpcNextPage; resp.OpcNextPage == nil {
 				break
 			}
 		}
-	}
 
+		// Process grouped data to create endpoints
+		for domain, rtypeMap := range recordMap {
+			for rtype, recordList := range rtypeMap {
+				var joinedRData []string
+				var ttl int
+
+				// Collect and join all rdata, ensuring consistent ttl (use first as default)
+				for _, record := range recordList {
+					joinedRData = append(joinedRData, record.RData)
+					ttl = record.TTL // Assuming all TTLs for same rtype are identical.
+				}
+				ep := endpoint.NewEndpointWithTTL(
+					domain,
+					rtype,
+					endpoint.TTL(ttl), // Use the collected TTL
+					joinedRData...
+				)
+				endpoints = append(endpoints, ep)
+			}
+		}
+	}
+	// fmt.Printf("Discovered Endpoints: %+v\n", endpoints)
 	return endpoints, nil
 }
+
 
 // ApplyChanges applies a given set of changes to a given zone.
 func (p *OCIProvider) ApplyChanges(ctx context.Context, changes *plan.Changes) error {
 	log.Debugf("Processing changes: %+v", changes)
 
 	ops := []dns.RecordOperation{}
-	ops = append(ops, p.newFilteredRecordOperations(changes.Create, dns.RecordOperationOperationAdd)...)
+	
 
 	ops = append(ops, p.newFilteredRecordOperations(changes.UpdateNew, dns.RecordOperationOperationAdd)...)
 	ops = append(ops, p.newFilteredRecordOperations(changes.UpdateOld, dns.RecordOperationOperationRemove)...)
 
 	ops = append(ops, p.newFilteredRecordOperations(changes.Delete, dns.RecordOperationOperationRemove)...)
+	
+	ops = append(ops, p.newFilteredRecordOperations(changes.Create, dns.RecordOperationOperationAdd)...)
 
 	if len(ops) == 0 {
 		log.Info("All records are already up to date")
@@ -300,26 +385,36 @@ func (p *OCIProvider) ApplyChanges(ctx context.Context, changes *plan.Changes) e
 }
 
 // newRecordOperation returns a RecordOperation based on a given endpoint.
-func newRecordOperation(ep *endpoint.Endpoint, opType dns.RecordOperationOperationEnum) dns.RecordOperation {
+func newRecordOperation(ep *endpoint.Endpoint, opType dns.RecordOperationOperationEnum) []dns.RecordOperation {
 	targets := make([]string, len(ep.Targets))
+	ops := []dns.RecordOperation{}
+
 	copy(targets, ep.Targets)
+	// fmt.Printf("Targets: %+v\n", targets)
+	// fmt.Printf("Endpoint: %+v\n", ep)
+
 	if ep.RecordType == endpoint.RecordTypeCNAME {
 		targets[0] = provider.EnsureTrailingDot(targets[0])
 	}
-	rdata := strings.Join(targets, " ")
 
 	ttl := ociRecordTTL
 	if ep.RecordTTL.IsConfigured() {
 		ttl = int(ep.RecordTTL)
 	}
 
-	return dns.RecordOperation{
-		Domain:    &ep.DNSName,
-		Rdata:     &rdata,
-		Ttl:       &ttl,
-		Rtype:     &ep.RecordType,
-		Operation: opType,
+	for _, target := range targets {
+		ops = append(ops, dns.RecordOperation{
+			Domain:    &ep.DNSName,
+			Rdata:     &target,
+			Ttl:       &ttl,
+			Rtype:     &ep.RecordType,
+			Operation: opType,
+		})
 	}
+
+
+
+	return ops
 }
 
 // operationsByZone segments a slice of RecordOperations by their zone.
@@ -346,6 +441,6 @@ func operationsByZone(zones map[string]dns.ZoneSummary, ops []dns.RecordOperatio
 			delete(changes, zone)
 		}
 	}
-
+	// fmt.Printf("Changes: %+v\n", changes)
 	return changes
 }
